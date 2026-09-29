@@ -1,0 +1,456 @@
+#!/usr/bin/env bash
+#
+# sweep - find and clean up junk on Arch Linux / Omarchy
+# https://github.com/skylightlim/sweep
+#
+# Looks where junk usually piles up (pacman and AUR caches, orphaned packages,
+# old mise tool versions, developer caches, stale ~/.cache files, trash,
+# config backups, crash dumps, logs), shows how much each would free, and
+# deletes only what you pick. Steps that touch system files use sudo.
+
+set -o nounset -o pipefail
+
+DAYS=${SWEEP_DAYS:-30}
+KEEP=${SWEEP_KEEP:-2}
+JOURNAL_MAX=${SWEEP_JOURNAL:-200M}
+
+CACHE=${XDG_CACHE_HOME:-$HOME/.cache}
+CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}
+DATA=${XDG_DATA_HOME:-$HOME/.local/share}
+COREDUMPS=/var/lib/systemd/coredump
+
+# Order the steps run in: sudo steps first so one password prompt covers them,
+# and orphans before the pacman cache so their packages count as uninstalled
+STEPS=(orphans pkgcache journal coredumps aur mise devcache appcache trash backups)
+
+usage() {
+  cat <<EOF
+Usage: sweep [-n]
+
+Finds junk on Arch Linux / Omarchy, shows how much space each kind takes,
+and cleans only what you pick. Nothing is deleted before you confirm.
+
+  -n, --dry-run   scan and report only
+  -h, --help      show this help
+
+Settings (environment variables):
+  SWEEP_DAYS=$DAYS         files in ~/.cache unused this many days are stale
+  SWEEP_KEEP=$KEEP          package versions to keep in the pacman cache
+  SWEEP_JOURNAL=$JOURNAL_MAX    trim the system journal down to this size
+EOF
+}
+
+if [[ -t 1 ]]; then
+  BOLD=$'\e[1m' DIM=$'\e[2m' RED=$'\e[31m' GREEN=$'\e[32m' YELLOW=$'\e[33m' RESET=$'\e[0m'
+else
+  BOLD='' DIM='' RED='' GREEN='' YELLOW='' RESET=''
+fi
+
+WORK=$(mktemp -d -t sweep.XXXXXX) || exit 1
+trap 'rm -rf "$WORK"' EXIT
+
+# One entry per kind of junk found, filled in by the scan_* functions
+ids=() names=() infos=() sizes=() sudos=() defaults=() tips=() order=()
+# What each clean_* step deletes, saved by its scan so exactly that is removed
+ORPHANS=() MISE_PATHS=() DEV_PATHS=() BACKUPS=()
+
+# ------------------------------------------------------------------ helpers
+
+die() { echo "${RED}sweep: $*${RESET}" >&2; exit 1; }
+have() { command -v "$1" >/dev/null; }
+tip() { tips+=("$*"); }
+
+# add ID BYTES NEEDS_SUDO SELECTED_BY_DEFAULT NAME DETAILS
+add() {
+  (( ${2:-0} > 0 )) || return 0
+  ids+=("$1"); sizes+=("$2"); sudos+=("$3"); defaults+=("$4"); names+=("$5"); infos+=("$6")
+}
+
+# 1395864371 -> 1.3G
+human() {
+  awk -v b="${1:-0}" 'BEGIN {
+    split("B K M G T", unit); i = 1
+    while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    printf(i == 1 || b >= 100 ? "%.0f%s\n" : "%.1f%s\n", b, unit[i])
+  }'
+}
+
+# plural 1 file -> "1 file", plural 3 file -> "3 files"
+plural() { if (( $1 == 1 )); then echo "$1 $2"; else echo "$1 ${2}s"; fi; }
+
+shorten() {
+  local text=$1 max=${2:-70}
+  (( ${#text} > max )) && text="${text:0:max-1}…"
+  echo "$text"
+}
+
+# Total size in bytes of the given paths; missing ones count as 0
+size_of() {
+  (( $# )) || { echo 0; return; }
+  du -scb -- "$@" 2>/dev/null | awk 'END { print $1 + 0 }'
+}
+
+# rm -rf that refuses anything outside $HOME. Unlocks read-only folders first,
+# because makepkg leaves some behind that plain rm -rf can't delete.
+rm_home() {
+  local path status=0
+  for path in "$@"; do
+    if [[ $path != "$HOME"/?* || $path == */../* || $path == */.. ]]; then
+      echo "  ${YELLOW}skipped $path (sweep only deletes inside your home folder)${RESET}"
+      status=1
+      continue
+    fi
+    [[ -L $path ]] || chmod -R u+rwX -- "$path" 2>/dev/null
+    rm -rf -- "$path" || status=1
+  done
+  return "$status"
+}
+
+pacman_busy() { [[ -e /var/lib/pacman/db.lck ]]; }
+
+# ------------------------------------------------------------------ scanners
+
+scan_orphans() {
+  pacman_busy && { tip "pacman is running, so package checks were skipped. Run sweep again when it's done."; return; }
+  mapfile -t ORPHANS < <(pacman -Qdtq 2>/dev/null)
+  (( ${#ORPHANS[@]} )) || return 0
+  local bytes
+  bytes=$(LC_ALL=C pacman -Qi "${ORPHANS[@]}" 2>/dev/null | awk '
+    /^Installed Size/ {
+      m = 1
+      if ($5 == "KiB") m = 1024; else if ($5 == "MiB") m = 1048576; else if ($5 == "GiB") m = 1073741824
+      s += $4 * m
+    }
+    END { print int(s) }')
+  add orphans "$bytes" 1 0 "Orphaned packages" \
+    "$(plural ${#ORPHANS[@]} package) installed as dependencies but no longer needed: $(shorten "${ORPHANS[*]}" 50)"
+}
+clean_orphans() { sudo pacman -Rns "${ORPHANS[@]}"; }
+
+scan_pkgcache() {
+  have paccache || { tip "Install pacman-contrib so the pacman cache can be cleaned: sudo pacman -S pacman-contrib"; return; }
+  pacman_busy && return
+  local dir count bytes
+  dir=$(pacman-conf CacheDir 2>/dev/null | head -1)
+  { paccache -dvk"$KEEP"; paccache -dvuk0; } 2>/dev/null | grep '\.pkg\.tar' | sort -u > "$WORK/pkgcache"
+  count=$(grep -cv '\.sig$' "$WORK/pkgcache")
+  bytes=$(cd "${dir:-/var/cache/pacman/pkg}" 2>/dev/null &&
+    xargs -r -d '\n' stat -c %s -- < "$WORK/pkgcache" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }')
+  add pkgcache "${bytes:-0}" 1 1 "Pacman package cache" \
+    "$(plural "$count" "package file") of old versions or removed packages (keeps the newest $KEEP of each)"
+}
+clean_pkgcache() { sudo paccache -rk"$KEEP" && sudo paccache -ruk0; }
+
+scan_journal() {
+  local used max
+  used=$(LC_ALL=C journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMGT]' | head -1)
+  [[ -n $used ]] || return 0
+  used=$(numfmt --from=iec "$used") max=$(numfmt --from=iec "$JOURNAL_MAX") || return 0
+  (( used > max )) || return 0
+  add journal $(( used - max )) 1 1 "System logs (journal)" "$(human "$used") used, trimmed down to $JOURNAL_MAX"
+}
+clean_journal() { sudo journalctl --vacuum-size="$JOURNAL_MAX"; }
+
+scan_coredumps() {
+  local dumps
+  mapfile -t dumps < <(find "$COREDUMPS" -maxdepth 1 -type f -name 'core.*' 2>/dev/null)
+  (( ${#dumps[@]} )) || return 0
+  add coredumps "$(size_of "${dumps[@]}")" 1 0 "Crash dumps" \
+    "$(plural ${#dumps[@]} file) for debugging crashes (systemd deletes them after 2 weeks anyway)"
+}
+clean_coredumps() { sudo find "$COREDUMPS" -maxdepth 1 -type f -name 'core.*' -delete; }
+
+aur_roots() {
+  local dir
+  if have yay; then
+    dir=$(yay -Pg 2>/dev/null | jq -r '.buildDir // empty' 2>/dev/null)
+    echo "${dir:-$CACHE/yay}"
+  fi
+  have paru && echo "$CACHE/paru/clone"
+}
+
+# True if any package this AUR build folder makes is installed. Checks every
+# pkgname in .SRCINFO, so split packages count too.
+aur_installed() {
+  local names
+  names=$(sed -n 's/^[[:space:]]*pkgname = //p' "$1/.SRCINFO" 2>/dev/null)
+  # shellcheck disable=SC2086  # one package name per word
+  pacman -Qq ${names:-${1##*/}} 2>/dev/null | grep -q .
+}
+
+scan_aur() {
+  local root dir count=0 bytes=0 junk
+  : > "$WORK/aur-clean"
+  : > "$WORK/aur-remove"
+  if pgrep -x 'yay|paru|makepkg' >/dev/null; then
+    tip "An AUR build is running, so the AUR cache was skipped. Run sweep again when it's done."
+    return
+  fi
+  while read -r root; do
+    for dir in "$root"/*/; do
+      dir=${dir%/}
+      [[ -d $dir/.git && ! -L $dir ]] || continue
+      if aur_installed "$dir"; then
+        # Everything git doesn't track: built packages, downloads, -git clones.
+        # The PKGBUILD repo itself stays.
+        mapfile -t junk < <(git -C "$dir" clean -ffdxn 2>/dev/null | sed -n 's/^Would remove //p')
+        (( ${#junk[@]} )) || continue
+        echo "$dir" >> "$WORK/aur-clean"
+        bytes=$(( bytes + $(cd "$dir" && size_of "${junk[@]}") ))
+      else
+        echo "$dir" >> "$WORK/aur-remove"
+        bytes=$(( bytes + $(size_of "$dir") ))
+      fi
+      count=$(( count + 1 ))
+    done
+  done < <(aur_roots)
+  add aur "$bytes" 0 1 "AUR build cache" \
+    "$(plural "$count" package): old builds, downloads, -git sources (fetched again on the next update)"
+}
+clean_aur() {
+  local dir status=0
+  while read -r dir; do
+    chmod -R u+rwX -- "$dir" 2>/dev/null
+    git -C "$dir" clean -ffdxq || status=1
+  done < "$WORK/aur-clean"
+  while read -r dir; do
+    rm_home "$dir" || status=1
+  done < "$WORK/aur-remove"
+  return "$status"
+}
+
+scan_mise() {
+  have mise && have jq || return 0
+  NO_COLOR=1 mise ls --prunable --json 2>/dev/null |
+    jq -r 'to_entries[] | .key as $tool | .value[] | "\($tool)@\(.version)\t\(.install_path)"' \
+      > "$WORK/mise" 2>/dev/null
+  mapfile -t MISE_PATHS < <(cut -f2 "$WORK/mise")
+  (( ${#MISE_PATHS[@]} )) || return 0
+  add mise "$(size_of "${MISE_PATHS[@]}")" 0 1 "Old mise tool versions" \
+    "$(shorten "$(cut -f1 "$WORK/mise" | paste -sd' ')") (no config uses them)"
+}
+clean_mise() { mise prune --tools --yes; }
+
+scan_devcache() {
+  local entry tool path bytes busy=0 total=0 summary
+  local -A by_tool=()
+  local candidates=(
+    "npm:$HOME/.npm/_cacache" "pip:$CACHE/pip" "uv:$CACHE/uv" "go:$CACHE/go-build"
+    "cargo:$HOME/.cargo/registry/cache" "cargo:$HOME/.cargo/registry/src"
+    "bun:$HOME/.bun/install/cache" "yarn:$CACHE/yarn" "pnpm:$CACHE/pnpm"
+  )
+  # npx keeps each package in its own folder. Leave the ones a running
+  # program (like an MCP server) is using.
+  for path in "$HOME"/.npm/_npx/*/; do
+    [[ -d $path ]] || continue
+    if pgrep -f "${path%/}/" >/dev/null; then
+      busy=$(( busy + 1 ))
+    else
+      candidates+=("npx:${path%/}")
+    fi
+  done
+  for entry in "${candidates[@]}"; do
+    tool=${entry%%:*} path=${entry#*:}
+    [[ -d $path ]] || continue
+    DEV_PATHS+=("$path")
+    by_tool[$tool]=$(( ${by_tool[$tool]:-0} + $(size_of "$path") ))
+  done
+  (( ${#DEV_PATHS[@]} )) || return 0
+  for tool in "${!by_tool[@]}"; do total=$(( total + by_tool[$tool] )); done
+  summary=$(for tool in "${!by_tool[@]}"; do echo "${by_tool[$tool]} $tool"; done | sort -rn |
+    while read -r bytes tool; do printf '%s %s, ' "$tool" "$(human "$bytes")"; done)
+  summary=${summary%, }
+  (( busy )) && summary+=" ($(plural "$busy" "npx package") in use, kept)"
+  add devcache "$total" 0 1 "Developer download caches" "$summary"
+}
+clean_devcache() { rm_home "${DEV_PATHS[@]}"; }
+
+scan_appcache() {
+  [[ -d $CACHE ]] || return 0
+  local bytes top repo repos skip=()
+  # Leave out folders other steps handle, and git repos, which break when
+  # only some of their files are deleted
+  mapfile -d '' repos < <(find "$CACHE" -xdev -name .git -printf '%h\0' 2>/dev/null)
+  for path in yay paru pip uv go-build yarn pnpm; do skip+=(-path "$CACHE/$path" -o); done
+  for repo in "${repos[@]}"; do skip+=(-path "$repo" -o); done
+  find "$CACHE" -xdev \( "${skip[@]}" -false \) -prune \
+    -o -type f -atime +"$DAYS" -mtime +"$DAYS" \
+    -fprint0 "$WORK/appcache" -fprintf "$WORK/appcache-sizes" '%s\t%P\n' 2>/dev/null
+  bytes=$(awk -F'\t' '{ s += $1 } END { print s + 0 }' "$WORK/appcache-sizes" 2>/dev/null)
+  top=$(awk -F'\t' '{ split($2, p, "/"); s[p[1]] += $1 } END { for (d in s) print s[d] "\t" d }' \
+      "$WORK/appcache-sizes" 2>/dev/null | sort -rn | head -3 |
+    while IFS=$'\t' read -r b dir; do printf '%s %s, ' "$dir" "$(human "$b")"; done)
+  add appcache "${bytes:-0}" 0 1 "Stale app caches in ~/.cache" "files unused for $DAYS+ days: ${top%, }"
+}
+clean_appcache() { xargs -0 -r rm -f -- < "$WORK/appcache"; }
+
+scan_trash() {
+  local trash=$DATA/Trash count
+  count=$(find "$trash/files" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
+  (( count )) || return 0
+  add trash "$(size_of "$trash/files" "$trash/info" "$trash/expunged")" 0 0 "Trash" \
+    "$(plural "$count" item) you deleted in the file manager (gone for good after this)"
+}
+clean_trash() {
+  gio trash --empty 2>/dev/null || rm_home "$DATA/Trash/files" "$DATA/Trash/info" "$DATA/Trash/expunged"
+}
+
+scan_backups() {
+  mapfile -d '' BACKUPS < <(find "$CONFIG" -xdev -type f -regextype posix-extended \
+    -regex '.*\.bak\.[0-9]{9,}' -print0 2>/dev/null)
+  (( ${#BACKUPS[@]} )) || return 0
+  add backups "$(size_of "${BACKUPS[@]}")" 0 0 "Old config backups" \
+    "$(plural ${#BACKUPS[@]} file) named *.bak.<timestamp>, left behind by 'omarchy refresh'"
+}
+clean_backups() { rm_home "${BACKUPS[@]}"; }
+
+scan_tips() {
+  if have paccache && ! systemctl is-enabled --quiet paccache.timer 2>/dev/null; then
+    tip "Clean the pacman cache automatically every week: sudo systemctl enable --now paccache.timer"
+  fi
+  if have docker && systemctl is-active --quiet docker.service 2>/dev/null; then
+    tip "Docker is running. See what it could free with: docker system df"
+  fi
+  have flatpak && tip "Remove Flatpak runtimes nothing uses: flatpak uninstall --unused"
+  local pacnew
+  pacnew=$(find /etc -name '*.pacnew' 2>/dev/null | wc -l)
+  (( pacnew )) && tip "$(plural "$pacnew" ".pacnew file") in /etc waiting to be merged: sudo pacdiff"
+  if have dua; then
+    tip "To hunt big files yourself: dua i ~"
+  elif have ncdu; then
+    tip "To hunt big files yourself: ncdu ~"
+  fi
+}
+
+# ------------------------------------------------------------------ interface
+
+report() {
+  local i total=0
+  for i in "${order[@]}"; do total=$(( total + sizes[i] )); done
+  echo "${BOLD}Found $(human "$total") you can free:${RESET}"
+  echo
+  for i in "${order[@]}"; do
+    printf '  %s%6s%s  %s' "$BOLD" "$(human "${sizes[i]}")" "$RESET" "${names[i]}"
+    (( sudos[i] )) && printf '  %s(sudo)%s' "$DIM" "$RESET"
+    printf '\n  %6s  %s%s%s\n' '' "$DIM" "${infos[i]}" "$RESET"
+  done
+}
+
+show_tips() {
+  (( ${#tips[@]} )) || return 0
+  echo
+  echo "${BOLD}Tips:${RESET}"
+  printf '  • %s\n' "${tips[@]}"
+}
+
+# Prints the index of each kind of junk the user picked
+pick() {
+  local i label answer
+  if have gum; then
+    local options=() preselected=() flags=()
+    local -A index=()
+    for i in "${order[@]}"; do
+      label=$(printf '%-6s %s' "$(human "${sizes[i]}")" "${names[i]}")
+      options+=("$label")
+      index[$label]=$i
+      (( defaults[i] )) && preselected+=("$label")
+    done
+    (( ${#preselected[@]} )) && flags+=("--selected=$(IFS=,; echo "${preselected[*]}")")
+    gum choose --no-limit --header "Pick what to clean (space: toggle, enter: continue, esc: cancel)" \
+      "${flags[@]}" "${options[@]}" |
+      while IFS= read -r label; do
+        [[ -n ${index[$label]:-} ]] && echo "${index[$label]}"
+      done
+  else
+    for i in "${order[@]}"; do
+      local hint='y/N' default=n
+      (( defaults[i] )) && { hint='Y/n'; default=y; }
+      read -rp "Clean ${names[i]} ($(human "${sizes[i]}"))? [$hint] " answer < /dev/tty
+      [[ ${answer:-$default} == [yY]* ]] && echo "$i"
+    done
+  fi
+}
+
+confirm() {
+  if have gum; then
+    gum confirm "$1"
+  else
+    local answer
+    read -rp "$1 [y/N] " answer < /dev/tty
+    [[ $answer == [yY]* ]]
+  fi
+}
+
+main() {
+  local dry_run=0 i id freed=0 picked=0 needs_sudo=0 chosen=()
+  local -A want=()
+
+  case ${1:-} in
+    -n | --dry-run) dry_run=1 ;;
+    -h | --help) usage; return 0 ;;
+    '') ;;
+    *) usage >&2; return 2 ;;
+  esac
+  (( EUID != 0 )) || die "run sweep as your normal user; it asks for sudo when a step needs it"
+
+  [[ -t 1 ]] && printf '%sScanning...%s' "$DIM" "$RESET"
+  scan_orphans; scan_pkgcache; scan_journal; scan_coredumps; scan_aur
+  scan_mise; scan_devcache; scan_appcache; scan_trash; scan_backups; scan_tips
+  [[ -t 1 ]] && printf '\r\e[K'
+
+  mapfile -t order < <(for i in "${!ids[@]}"; do echo "${sizes[i]} $i"; done | sort -rn | cut -d' ' -f2)
+
+  if (( ${#ids[@]} == 0 )); then
+    echo "${GREEN}Nothing to clean. Your system is tidy.${RESET}"
+    show_tips
+    return 0
+  fi
+  report
+  show_tips
+  (( dry_run )) && return 0
+  if [[ ! -t 0 ]]; then
+    echo
+    echo "Run sweep in a terminal to pick what to clean."
+    return 0
+  fi
+
+  echo
+  mapfile -t chosen < <(pick)
+  if (( ${#chosen[@]} == 0 )); then
+    echo "Nothing picked, nothing deleted."
+    return 0
+  fi
+  echo "You picked:"
+  for i in "${chosen[@]}"; do
+    echo "  • ${names[i]} ($(human "${sizes[i]}"))"
+    want[${ids[i]}]=$i
+    picked=$(( picked + sizes[i] ))
+    (( sudos[i] )) && needs_sudo=1
+  done
+  confirm "Delete these now? (about $(human "$picked"))" || { echo "Cancelled, nothing deleted."; return 0; }
+
+  if (( needs_sudo )) && ! sudo -v; then
+    echo "${YELLOW}No admin rights, so the (sudo) steps are skipped.${RESET}"
+    for i in "${chosen[@]}"; do (( sudos[i] )) && unset "want[${ids[i]}]"; done
+  fi
+
+  for id in "${STEPS[@]}"; do
+    [[ -n ${want[$id]:-} ]] || continue
+    i=${want[$id]}
+    echo "${BOLD}→ ${names[i]}${RESET}"
+    if "clean_$id"; then
+      freed=$(( freed + sizes[i] ))
+    else
+      echo "  ${RED}✗ this step did not finish${RESET}"
+    fi
+  done
+
+  echo
+  echo "${GREEN}${BOLD}Done. Freed about $(human "$freed").${RESET}"
+  if [[ -n ${want[orphans]:-} ]] && have snapper; then
+    echo "${DIM}Btrfs snapshots keep removed packages on disk until snapper rotates old snapshots out.${RESET}"
+  fi
+}
+
+# Run only when executed, so the functions can also be sourced for testing
+[[ ${BASH_SOURCE[0]} == "$0" ]] && main "$@"
